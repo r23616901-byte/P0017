@@ -4,9 +4,3 @@ scikit-learn
 numpy 
 werkzeug 
 eventlet
-opencv-python
-pillow
-python-dotenv
-ultralytics
-torch
-torchvision
