@@ -1,76 +1,2005 @@
-from flask import Flask, jsonify, render_template_string, request, redirect, session, send_from_directory
-from blockchain import Blockchain, GovernmentProject, Contractor
-from sklearn.ensemble import IsolationForest
+from flask import Flask, render_template_string, request, jsonify
+from flask_socketio import SocketIO, emit
+import cv2
 import numpy as np
+import base64
+import threading
+import json
 import os
+from datetime import datetime
+import image as detection_module
 from werkzeug.utils import secure_filename
-import image as image_module
-import datetime
-from flask_socketio import SocketIO
+from PIL import Image
+import io
+from blockchain import Blockchain
 
 app = Flask(__name__)
-app.secret_key = "supersecretkey"
-
-# Initialize Socket.IO for real-time updates
+app.secret_key = "xray-scanner-secret-key"
 socketio = SocketIO(app, cors_allowed_origins="*")
-
-# ---------------------------
-# GLOBAL SYSTEM STORAGE
-# ---------------------------
 blockchain = Blockchain()
 
-projects = {}
-contractors = {}
-payment_history = {}
-
-# Add available contractors for dropdown (dummy entries)
-available_contractors = [
-    "Dummy Contractor Ltd",
-    "Acme Infra Pvt Ltd",
-    "Bluebridge Constructions",
-    "Greenfield Builders",
-    "Sunrise Engineering Co",
-    "MetroCore Contractors"
-]
-
-# directory for uploads
+# Upload configuration
 UPLOAD_ROOT = os.path.join(os.path.dirname(__file__), "uploads")
 os.makedirs(UPLOAD_ROOT, exist_ok=True)
-ALLOWED_EXT = {"png", "jpg", "jpeg", "gif"}
+ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "mp4", "avi"}
 
-# store funding requests: { project_id: { status: "pending|approved|denied", before: filename, after: filename, requested_by: str } }
-funding_requests = {}
-
-# NEW: top-up requests storage (list per project)
-fund_requests = {}  # { project_id: [ {id, amount, message, status, requested_by, ts}, ... ] }
-
-# store work logs and ratings per project
-work_logs = {}      # { project_id: [ { milestone, completed_at (iso), days_taken } ] }
-ratings = {}        # { contractor_name: [ {score:int, comment:str, ts:iso, project_id:str, image:str} ] }
-
-def get_contractor_rating_summary():
-    summary = {}
-    for contractor_name, rs in ratings.items():
-        total = sum((r.get("score", 0) or 0) for r in rs)
-        count = len(rs)
-        summary[contractor_name] = {
-            "avg": round(total / count, 2) if count else 0,
-            "count": count,
-            "ratings": rs
-        }
-    return summary
+# Global variables
+detection_results = []
+threat_log = []
+scanning = False
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
 
-# ---------------------------
-# USERS
-# ---------------------------
-users = {
-    "gov": {"password": "gov123", "role": "government"},
-    "contractor": {"password": "contract123", "role": "contractor"},
-    "public": {"password": "public123", "role": "public"}
-}
+@app.route("/")
+def index():
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>🔍 X-RAY THREAT SCANNER - Security Screening System</title>
+        <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+        <style>
+            :root {
+                --primary: #00d4ff;
+                --primary-dark: #0088cc;
+                --danger: #ff3333;
+                --warning: #ffaa00;
+                --success: #00ff88;
+                --dark-bg: #0a0e27;
+                --card-bg: #1a1f3a;
+            }
+
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #0a0e27 0%, #1a0033 100%);
+                color: #e6f6ff;
+                overflow-x: hidden;
+            }
+
+            header {
+                background: linear-gradient(90deg, rgba(0, 212, 255, 0.1), rgba(0, 100, 150, 0.1));
+                padding: 20px;
+                text-align: center;
+                border-bottom: 2px solid var(--primary);
+                box-shadow: 0 4px 20px rgba(0, 212, 255, 0.2);
+            }
+
+            h1 {
+                font-size: 28px;
+                color: var(--primary);
+                text-shadow: 0 0 10px rgba(0, 212, 255, 0.5);
+                margin-bottom: 10px;
+            }
+
+            .container {
+                max-width: 1400px;
+                margin: 20px auto;
+                padding: 0 20px;
+            }
+
+            .camera-grid {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 20px;
+                margin-bottom: 30px;
+            }
+
+            @media (max-width: 1024px) {
+                .camera-grid {
+                    grid-template-columns: 1fr;
+                }
+            }
+
+            .camera-card {
+                background: var(--card-bg);
+                border: 2px solid var(--primary);
+                border-radius: 15px;
+                padding: 15px;
+                box-shadow: 0 0 20px rgba(0, 212, 255, 0.3), inset 0 0 10px rgba(0, 212, 255, 0.1);
+            }
+
+            .camera-label {
+                color: var(--primary);
+                font-weight: bold;
+                margin-bottom: 10px;
+                text-transform: uppercase;
+                font-size: 14px;
+                letter-spacing: 2px;
+            }
+
+            video, canvas {
+                width: 100%;
+                height: auto;
+                border-radius: 10px;
+                background: #000;
+                display: block;
+            }
+
+            .stats-row {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin-bottom: 20px;
+            }
+
+            .stat-box {
+                background: linear-gradient(135deg, rgba(0, 212, 255, 0.1), rgba(100, 150, 200, 0.1));
+                border: 1px solid var(--primary);
+                border-radius: 10px;
+                padding: 15px;
+                text-align: center;
+            }
+
+            .stat-value {
+                font-size: 24px;
+                color: var(--success);
+                font-weight: bold;
+            }
+
+            .stat-label {
+                color: #aaa;
+                font-size: 12px;
+                margin-top: 5px;
+            }
+
+            .controls {
+                text-align: center;
+                margin-bottom: 30px;
+            }
+
+            button {
+                padding: 12px 30px;
+                margin: 0 10px;
+                font-size: 14px;
+                font-weight: bold;
+                border: none;
+                border-radius: 8px;
+                cursor: pointer;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                transition: all 0.3s;
+                box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+            }
+
+            .btn-start {
+                background: linear-gradient(135deg, var(--success), #00cc66);
+                color: #000;
+            }
+
+            .btn-start:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(0, 255, 136, 0.4); }
+
+            .btn-stop {
+                background: linear-gradient(135deg, var(--danger), #cc0000);
+                color: #fff;
+            }
+
+            .btn-stop:hover { transform: translateY(-3px); box-shadow: 0 6px 20px rgba(255, 51, 51, 0.4); }
+
+            .threat-log {
+                background: var(--card-bg);
+                border: 2px solid var(--danger);
+                border-radius: 15px;
+                padding: 20px;
+                margin-top: 30px;
+                max-height: 400px;
+                overflow-y: auto;
+            }
+
+            .threat-entry {
+                background: rgba(255, 51, 51, 0.1);
+                border-left: 4px solid var(--danger);
+                padding: 10px;
+                margin-bottom: 10px;
+                border-radius: 5px;
+                font-size: 13px;
+            }
+
+            .threat-time {
+                color: var(--warning);
+                font-weight: bold;
+            }
+
+            .threat-item {
+                color: var(--danger);
+                font-weight: bold;
+                margin-top: 5px;
+            }
+
+            .confidence {
+                color: var(--primary);
+                font-size: 12px;
+                margin-top: 3px;
+            }
+
+            .upload-section {
+                background: var(--card-bg);
+                border: 2px dashed var(--primary);
+                border-radius: 15px;
+                padding: 30px;
+                text-align: center;
+                margin-top: 30px;
+            }
+
+            .upload-section h3 {
+                color: var(--primary);
+                margin-bottom: 15px;
+            }
+
+            input[type="file"] {
+                padding: 10px;
+                margin: 10px 0;
+                background: rgba(0, 212, 255, 0.1);
+                border: 1px solid var(--primary);
+                border-radius: 8px;
+                color: #fff;
+                cursor: pointer;
+            }
+
+            .scrollbar-hide::-webkit-scrollbar { display: none; }
+            .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+        </style>
+    </head>
+    <body>
+        <header>
+            <h1>🔍 X-RAY THREAT SCANNER</h1>
+            <p>Real-time Security Screening System with AI Threat Detection</p>
+            <nav style="margin-top: 15px;">
+                <a href="/blockchain" style="color: var(--primary); text-decoration: none; padding: 8px 16px; border: 1px solid var(--primary); border-radius: 5px; margin: 0 5px; transition: all 0.3s;">⛓ View Blockchain</a>
+            </nav>
+        </header>
+
+        <div class="container">
+            <div class="controls">
+                <button class="btn-start" onclick="startScanning()">START DUAL SCANNING</button>
+                <button class="btn-stop" onclick="stopScanning()">STOP SCANNING</button>
+            </div>
+
+            <div class="stats-row">
+                <div class="stat-box">
+                    <div class="stat-value" id="threat-count">0</div>
+                    <div class="stat-label">THREATS DETECTED</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="scan-status">READY</div>
+                    <div class="stat-label">SCAN STATUS</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="frame-count">0</div>
+                    <div class="stat-label">FRAMES PROCESSED</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="current-threat">NONE</div>
+                    <div class="stat-label">CURRENT THREAT</div>
+                </div>
+            </div>
+
+            <div class="camera-grid">
+                <div class="camera-card">
+                    <div class="camera-label">📹 NORMAL CAMERA</div>
+                    <video id="video-normal" autoplay playsinline muted></video>
+                </div>
+                <div class="camera-card">
+                    <div class="camera-label">🔍 X-RAY SCANNER</div>
+                    <canvas id="canvas-xray"></canvas>
+                </div>
+            </div>
+
+            <div class="threat-log scrollbar-hide" id="threat-log">
+                <h3 style="color: var(--danger); margin-bottom: 15px;">⚠️ THREAT LOG</h3>
+                <div id="log-entries" style="color: #aaa;">No threats detected yet...</div>
+            </div>
+
+            <div class="upload-section">
+                <h3>📤 Upload Image for Analysis</h3>
+                <form id="uploadForm" enctype="multipart/form-data">
+                    <input type="file" id="uploadFile" accept="image/*" required>
+                    <button type="submit" class="btn-start">ANALYZE IMAGE WITH AI</button>
+                </form>
+                <div id="uploadResult" style="margin-top: 15px; color: var(--primary);"></div>
+            </div>
+        </div>
+
+        <script>
+            const socket = io();
+            let scanning = false;
+            let frameCount = 0;
+            let threatCount = 0;
+            const threats = [];
+            const latestDetections = [];
+            const detectionKeys = new Set();
+            let audioCtx = null;
+
+            async function startScanning() {
+                scanning = true;
+                document.getElementById('scan-status').textContent = 'SCANNING';
+                document.getElementById('scan-status').style.color = 'var(--success)';
+                
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+                    const videoElement = document.getElementById('video-normal');
+                    videoElement.srcObject = stream;
+                    
+                    videoElement.onloadedmetadata = () => {
+                        captureFrames();
+                    };
+                } catch (error) {
+                    console.error('Camera access error:', error);
+                    alert('Unable to access camera. Please check permissions.');
+                    scanning = false;
+                    document.getElementById('scan-status').textContent = 'ERROR';
+                    document.getElementById('scan-status').style.color = 'var(--danger)';
+                }
+            }
+
+            function stopScanning() {
+                scanning = false;
+                document.getElementById('scan-status').textContent = 'STOPPED';
+                document.getElementById('scan-status').style.color = 'var(--warning)';
+                const videoElement = document.getElementById('video-normal');
+                if (videoElement.srcObject) {
+                    videoElement.srcObject.getTracks().forEach(track => track.stop());
+                }
+            }
+
+            function captureFrames() {
+                if (!scanning) return;
+                
+                const videoElement = document.getElementById('video-normal');
+                const canvasXray = document.getElementById('canvas-xray');
+                const ctx = canvasXray.getContext('2d');
+                
+                canvasXray.width = videoElement.videoWidth;
+                canvasXray.height = videoElement.videoHeight;
+                
+                ctx.drawImage(videoElement, 0, 0);
+                
+                const imageData = ctx.getImageData(0, 0, canvasXray.width, canvasXray.height);
+                const xrayEffect = applyXrayEffect(imageData);
+                ctx.putImageData(xrayEffect, 0, 0);
+                drawDetectionBoxes(ctx, canvasXray, latestDetections);
+                
+                frameCount++;
+                document.getElementById('frame-count').textContent = frameCount;
+                
+                // Send frame for detection every 2 frames
+                if (frameCount % 2 === 0) {
+                    canvasXray.toBlob(blob => {
+                        uploadFrame(blob);
+                    }, 'image/jpeg', 0.6);
+                }
+                
+                requestAnimationFrame(captureFrames);
+            }
+
+            function applyXrayEffect(imageData) {
+                const data = imageData.data;
+                for (let i = 0; i < data.length; i += 4) {
+                    const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+                    const inverted = 255 - gray;
+                    
+                    data[i] = Math.max(0, inverted * 0.3);        // Red
+                    data[i + 1] = Math.min(255, inverted * 1.3);  // Green
+                    data[i + 2] = Math.max(0, inverted * 0.5);    // Blue
+                    data[i + 3] = 255;                             // Alpha
+                }
+                return imageData;
+            }
+
+            async function uploadFrame(blob) {
+                try {
+                    const formData = new FormData();
+                    formData.append('frame', blob, 'frame.jpg');
+                    
+                    const response = await fetch('/detect_dual', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    const result = await response.json();
+                    
+                    let newThreatDetected = false;
+                    latestDetections.length = 0;
+                    
+                    if (result.detections && result.detections.length > 0) {
+                        result.detections.forEach(detection => {
+                            latestDetections.push(detection);
+                            const threatKey = `${detection.item}-${detection.severity}-${Math.round(detection.confidence * 100)}`;
+                            if (!detectionKeys.has(threatKey)) {
+                                detectionKeys.add(threatKey);
+                                newThreatDetected = true;
+                            }
+                            if (!threats.find(t => t.key === threatKey)) {
+                                const threatEntry = {
+                                    key: threatKey,
+                                    item: detection.item,
+                                    severity: detection.severity,
+                                    confidence: (detection.confidence * 100).toFixed(1),
+                                    timestamp: new Date().toLocaleTimeString()
+                                };
+                                threats.unshift(threatEntry);
+                                threatCount++;
+                                updateThreatLog();
+                            }
+                        });
+                    }
+                    if (newThreatDetected) {
+                        playBeep(0.5);
+                    }
+                } catch (error) {
+                    console.error('Upload error:', error);
+                }
+            }
+
+            function ensureAudioContext() {
+                if (!audioCtx) {
+                    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                return audioCtx;
+            }
+
+            function playBeep(duration = 0.5, frequency = 880) {
+                try {
+                    const ctx = ensureAudioContext();
+                    const oscillator = ctx.createOscillator();
+                    const gainNode = ctx.createGain();
+                    oscillator.type = 'sine';
+                    oscillator.frequency.value = frequency;
+                    gainNode.gain.setValueAtTime(0.2, ctx.currentTime);
+                    oscillator.connect(gainNode);
+                    gainNode.connect(ctx.destination);
+                    oscillator.start();
+                    oscillator.stop(ctx.currentTime + duration);
+                    gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+                } catch (err) {
+                    console.warn('Beep not available:', err);
+                }
+            }
+
+            function drawDetectionBoxes(ctx, canvas, detections) {
+                if (!detections || detections.length === 0) {
+                    return;
+                }
+
+                detections.forEach(detection => {
+                    const bbox = detection.bbox || [];
+                    if (bbox.length !== 4) return;
+
+                    const [x1, y1, x2, y2] = bbox;
+                    const width = x2 - x1;
+                    const height = y2 - y1;
+                    const color = detection.color || '#00ff00';
+                    const label = `${detection.item} (${detection.severity})`;
+
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = 4;
+                    ctx.strokeRect(x1, y1, width, height);
+
+                    ctx.font = '18px Arial';
+                    const textWidth = ctx.measureText(label).width;
+                    const textHeight = 22;
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+                    ctx.fillRect(x1, Math.max(y1 - textHeight - 4, 0), textWidth + 10, textHeight + 4);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillText(label, x1 + 5, Math.max(y1 - 8, textHeight));
+                });
+            }
+
+            function updateThreatLog() {
+                document.getElementById('threat-count').textContent = threatCount;
+                const logEntries = document.getElementById('log-entries');
+                
+                if (threats.length === 0) {
+                    logEntries.textContent = 'No threats detected yet...';
+                    document.getElementById('current-threat').textContent = 'NONE';
+                    return;
+                }
+                
+                const latest = threats[0];
+                document.getElementById('current-threat').textContent = `${latest.item} (${latest.severity})`;
+                
+                logEntries.innerHTML = threats.map(t => `
+                    <div class="threat-entry">
+                        <div class="threat-time">${t.timestamp}</div>
+                        <div class="threat-item">⚠️ ${t.item}</div>
+                        <div class="confidence">Severity: ${t.severity} | Confidence: ${t.confidence}%</div>
+                    </div>
+                `).join('');
+            }
+
+            // Image upload handler
+            document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const file = document.getElementById('uploadFile').files[0];
+                if (!file) return;
+                
+                const resultDiv = document.getElementById('uploadResult');
+                resultDiv.innerHTML = '<div style="color: var(--primary);">🔍 Analyzing image...</div>';
+                
+                const formData = new FormData();
+                formData.append('image', file);
+                
+                try {
+                    const response = await fetch('/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result.success && result.detections && result.detections.length > 0) {
+                        let html = `<div style="color: var(--success); margin-bottom: 15px; font-size: 16px; font-weight: bold;">✅ ${result.message}</div>`;
+                        
+                        // Display annotated image if available
+                        if (result.annotated_image) {
+                            html += `
+                                <div style="margin-bottom: 20px; border: 2px solid var(--primary); border-radius: 10px; overflow: hidden; background: #000;">
+                                    <img src="data:image/jpeg;base64,${result.annotated_image}" 
+                                         style="width: 100%; height: auto; display: block; max-height: 500px; object-fit: contain;">
+                                </div>
+                            `;
+                        }
+                        
+                        html += '<div style="color: var(--primary); font-weight: bold; margin-bottom: 10px;">🔴 DETECTION DETAILS:</div>';
+                        
+                        result.detections.forEach((detection, idx) => {
+                            const confidencePercent = (detection.confidence * 100).toFixed(1);
+                            const severityColor = getSeverityColor(detection.severity);
+                            
+                            html += `
+                                <div style="background: rgba(255, 51, 51, 0.1); border-left: 5px solid ${severityColor}; padding: 12px; margin-bottom: 10px; border-radius: 5px;">
+                                    <div style="font-weight: bold; color: ${severityColor}; font-size: 16px; margin-bottom: 5px;">
+                                        #${idx+1} - ⚠️ ${detection.item.toUpperCase()}
+                                    </div>
+                                    <div style="color: var(--warning); margin: 5px 0;">
+                                        🔴 Severity: <strong>${detection.severity}</strong>
+                                    </div>
+                                    <div style="color: var(--primary); margin: 5px 0;">
+                                        📊 Confidence Score: <strong>${confidencePercent}%</strong>
+                                    </div>
+                                    <div style="font-size: 12px; color: #aaa; margin-top: 8px;">
+                                        Risk Assessment: ${getThreatLevel(detection.severity, confidencePercent)}
+                                    </div>
+                                </div>
+                            `;
+                        });
+                        
+                        resultDiv.innerHTML = html;
+                    } else {
+                        resultDiv.innerHTML = '<div style="color: var(--success); font-size: 16px;">✅ No threats detected in uploaded image.</div>';
+                    }
+                } catch (error) {
+                    resultDiv.innerHTML = '<div style="color: var(--danger);">❌ Error analyzing image. Please try again.</div>';
+                    console.error('Upload error:', error);
+                }
+            });
+            
+            function getSeverityColor(severity) {
+                switch(severity) {
+                    case 'CRITICAL': return 'var(--danger)';
+                    case 'HIGH': return 'var(--warning)';
+                    case 'WARNING': return '#ff8800';
+                    case 'SCANNING': return 'var(--primary)';
+                    default: return '#888';
+                }
+            }
+            
+            function getThreatLevel(severity, confidence) {
+                const conf = parseFloat(confidence);
+                if (severity === 'CRITICAL' && conf > 70) return 'EXTREME - Immediate Action Required';
+                if (severity === 'HIGH' && conf > 60) return 'HIGH - Security Alert';
+                if (severity === 'WARNING' && conf > 50) return 'MEDIUM - Monitor Closely';
+                if (severity === 'SCANNING') return 'LOW - Routine Check';
+                return 'UNKNOWN - Further Analysis Needed';
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    if "image" not in request.files:
+        return jsonify({"error": "No image provided"}), 400
+    
+    image_file = request.files["image"]
+    if not allowed_file(image_file.filename):
+        return jsonify({"error": "Invalid file type"}), 400
+    
+    try:
+        # Save temporarily
+        filename = secure_filename(f"upload_{datetime.now().timestamp()}_{image_file.filename}")
+        filepath = os.path.join(UPLOAD_ROOT, filename)
+        image_file.save(filepath)
+        
+        # Detect threats
+        result = detection_module.detect_threats(filepath)
+        
+        # Ensure we return detections in the right format
+        if isinstance(result, dict) and "detections" in result:
+            detections = result["detections"]
+            annotated_frame = result.get("annotated_frame")
+        else:
+            detections = result if isinstance(result, list) else []
+            annotated_frame = None
+        
+        # Format detections for better display
+        formatted_detections = []
+        for detection in detections:
+            formatted_detections.append({
+                "item": detection.get("item", "Unknown"),
+                "severity": detection.get("severity", "UNKNOWN"),
+                "confidence": detection.get("confidence", 0.0),
+                "bbox": detection.get("bbox", []),
+                "color": detection.get("color", "#FF0000")
+            })
+        
+        # Convert annotated frame to base64 for display
+        annotated_image_base64 = None
+        if annotated_frame is not None:
+            _, buffer = cv2.imencode('.jpg', annotated_frame)
+            annotated_image_base64 = base64.b64encode(buffer).decode('utf-8')
+        
+        # Read and convert original uploaded image to base64
+        original_image_base64 = None
+        try:
+            with open(filepath, 'rb') as img_file:
+                original_image_base64 = base64.b64encode(img_file.read()).decode('utf-8')
+        except:
+            pass
+        
+        # Add scan to blockchain with image data
+        blockchain.add_block({
+            "action": "Image Scan",
+            "filename": filename,
+            "timestamp": datetime.now().isoformat(),
+            "detections": formatted_detections,
+            "total_threats": len(formatted_detections),
+            "original_image": original_image_base64,
+            "annotated_image": annotated_image_base64
+        })
+        
+        return jsonify({
+            "success": True,
+            "detections": formatted_detections,
+            "filename": filename,
+            "total_threats": len(formatted_detections),
+            "message": f"Analysis complete. Found {len(formatted_detections)} potential threat(s).",
+            "annotated_image": annotated_image_base64
+        })
+    
+    except Exception as e:
+        print(f"Upload error: {e}")
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/detect", methods=["POST"])
+def detect():
+    if "frame" not in request.files:
+        return jsonify({"error": "No frame provided"}), 400
+    
+    frame = request.files["frame"]
+    frame_data = frame.read()
+    
+    # Convert byte stream to image
+    img = Image.open(io.BytesIO(frame_data))
+    
+    # Temporary save for processing
+    temp_path = os.path.join(UPLOAD_ROOT, "temp_frame.jpg")
+    img.save(temp_path)
+    
+    # Detect objects
+    result = detection_module.detect_threats(temp_path)
+    
+    # Handle both old and new return formats
+    if isinstance(result, dict) and "detections" in result:
+        detections = result["detections"]
+    else:
+        detections = result if isinstance(result, list) else []
+    
+    return jsonify({
+        "success": True,
+        "detections": detections
+    })
+
+@app.route("/detect_dual", methods=["POST"])
+def detect_dual():
+    """
+    Real-time threat detection with YOLOv8.
+    Used for continuous frame scanning with dual cameras.
+    """
+    if "frame" not in request.files:
+        return jsonify({"error": "No frame provided"}), 400
+    
+    try:
+        frame_file = request.files["frame"]
+        frame_data = frame_file.read()
+        
+        # Convert byte stream to OpenCV format
+        nparr = np.frombuffer(frame_data, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            return jsonify({"detections": []})
+        
+        # Run real object detection
+        result = detection_module.detect_threats_from_frame(frame, "stream")
+        detections = result.get("detections", [])
+        
+        # Filter for only threats (not INFO level items unless suspicious context)
+        threat_detections = [d for d in detections if d.get("severity") in ["CRITICAL", "HIGH", "SCANNING"]]
+        
+        return jsonify({
+            "success": True,
+            "detections": threat_detections
+        })
+    
+    except Exception as e:
+        print(f"Dual detection error: {e}")
+        return jsonify({"success": False, "detections": [], "error": str(e)})
+
+
+@app.route("/blockchain")
+def blockchain_page():
+    html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⛓ Blockchain Ledger</title>
+    <style>
+        :root {
+            --primary: #00d4ff;
+            --danger: #ff3333;
+            --success: #00ff88;
+            --dark-bg: #0a0e27;
+            --card-bg: #1a1f3a;
+            --text-light: #e0e0e0;
+            --text-muted: #888;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Arial, sans-serif;
+            background: linear-gradient(135deg, var(--dark-bg) 0%, #0f1629 100%);
+            color: var(--text-light);
+            overflow-x: hidden;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 2px solid var(--primary);
+            padding-bottom: 20px;
+        }
+        h1 {
+            font-size: 2.2em;
+            color: var(--primary);
+            text-shadow: 0 0 20px rgba(0, 212, 255, 0.5);
+            margin-bottom: 10px;
+        }
+        .nav {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .nav a {
+            color: var(--primary);
+            text-decoration: none;
+            padding: 10px 20px;
+            border: 1px solid var(--primary);
+            border-radius: 5px;
+            margin: 0 10px;
+            display: inline-block;
+            transition: all 0.3s;
+            cursor: pointer;
+        }
+        .nav a:hover {
+            background: var(--primary);
+            color: #000;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+        .stat-box {
+            background: rgba(0, 212, 255, 0.1);
+            border: 1px solid var(--primary);
+            border-radius: 8px;
+            padding: 15px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 28px;
+            color: var(--success);
+            font-weight: bold;
+        }
+        .stat-label {
+            color: var(--text-muted);
+            font-size: 12px;
+            margin-top: 5px;
+        }
+        .blocks-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .block-card {
+            background: var(--card-bg);
+            border: 2px solid var(--primary);
+            border-radius: 10px;
+            padding: 15px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 0 15px rgba(0, 212, 255, 0.1);
+        }
+        .block-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 0 30px rgba(0, 212, 255, 0.3);
+            border-color: var(--success);
+        }
+        .block-header {
+            font-size: 1.1em;
+            color: var(--success);
+            font-weight: bold;
+            margin-bottom: 10px;
+            border-bottom: 1px solid var(--primary);
+            padding-bottom: 10px;
+        }
+        .block-preview {
+            color: var(--text-muted);
+            font-size: 0.85em;
+            margin: 5px 0;
+        }
+        .hash-preview {
+            color: var(--primary);
+            font-size: 0.7em;
+            word-break: break-all;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--primary);
+            font-family: monospace;
+            background: rgba(0, 212, 255, 0.1);
+            padding: 5px;
+            border-radius: 3px;
+        }
+        .hash-link {
+            color: var(--success);
+            font-size: 0.65em;
+            margin-top: 3px;
+            font-family: monospace;
+        }
+        .threat-badge {
+            display: inline-block;
+            background: rgba(255, 51, 51, 0.2);
+            border: 1px solid var(--danger);
+            color: var(--danger);
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 0.75em;
+            margin-top: 5px;
+        }
+        .threat-badge.high {
+            background: rgba(255, 165, 0, 0.2);
+            border-color: var(--warning);
+            color: var(--warning);
+        }
+        .threat-badge.success {
+            background: rgba(0, 255, 136, 0.2);
+            border-color: var(--success);
+            color: var(--success);
+        }
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            overflow-y: auto;
+        }
+        .modal.active {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal-content {
+            background: var(--card-bg);
+            border: 2px solid var(--primary);
+            border-radius: 10px;
+            padding: 30px;
+            max-width: 900px;
+            width: 95%;
+            max-height: 90vh;
+            overflow-y: auto;
+            position: relative;
+        }
+        .close-btn {
+            position: absolute;
+            top: 15px;
+            right: 20px;
+            background: var(--danger);
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1.2em;
+        }
+        .close-btn:hover {
+            background: #cc0000;
+        }
+        .modal-header {
+            color: var(--primary);
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            border-bottom: 2px solid var(--primary);
+            padding-bottom: 15px;
+        }
+        .modal-body {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .image-section {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .image-section img {
+            max-width: 100%;
+            border: 2px solid var(--primary);
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+        .image-label {
+            color: var(--text-muted);
+            font-size: 0.9em;
+            text-align: center;
+        }
+        .images-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 15px;
+        }
+        .details-section {
+            display: flex;
+            flex-direction: column;
+            grid-column: 2;
+        }
+        .detail-item {
+            background: rgba(0, 212, 255, 0.1);
+            padding: 12px;
+            border-left: 3px solid var(--primary);
+            margin-bottom: 10px;
+            border-radius: 4px;
+        }
+        .detail-label {
+            color: var(--primary);
+            font-weight: bold;
+            font-size: 0.9em;
+        }
+        .detail-value {
+            color: var(--text-light);
+            margin-top: 4px;
+        }
+        .threats-list {
+            margin-top: 20px;
+        }
+        .threats-list h3 {
+            color: var(--primary);
+            margin-bottom: 10px;
+            border-bottom: 1px solid var(--primary);
+            padding-bottom: 10px;
+        }
+        .threat-item {
+            background: rgba(255, 51, 51, 0.1);
+            border-left: 3px solid var(--danger);
+            padding: 10px;
+            margin-bottom: 8px;
+            border-radius: 4px;
+        }
+        .threat-item.high {
+            border-left-color: var(--warning);
+            background: rgba(255, 165, 0, 0.1);
+        }
+        .threat-item.medium {
+            border-left-color: var(--success);
+            background: rgba(0, 255, 136, 0.1);
+        }
+        .threat-name {
+            font-weight: bold;
+            color: var(--text-light);
+        }
+        .threat-severity {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 0.8em;
+            margin-left: 8px;
+        }
+        .threat-severity.critical {
+            background: var(--danger);
+            color: white;
+        }
+        .threat-severity.high {
+            background: var(--warning);
+            color: #000;
+        }
+        .threat-severity.medium {
+            background: var(--success);
+            color: #000;
+        }
+        .threat-confidence {
+            color: var(--text-muted);
+            font-size: 0.85em;
+            margin-top: 4px;
+        }
+        @media (max-width: 768px) {
+            .modal-body {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>⛓ Blockchain Ledger</h1>
+            <p style="color: var(--text-muted);">Immutable record of all X-RAY scans</p>
+        </header>
+
+        <div class="nav">
+            <a href="/">← Back to Scanner</a>
+        </div>
+
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-value">""" + str(len(blockchain.chain)) + """</div>
+                <div class="stat-label">Total Blocks</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">""" + str(len(blockchain.chain) - 1) + """</div>
+                <div class="stat-label">Scans Recorded</div>
+            </div>
+        </div>
+
+        <div class="blocks-grid" id="blocksGrid"></div>
+    </div>
+
+    <!-- Detail Modal -->
+    <div class="modal" id="detailModal">
+        <div class="modal-content">
+            <button class="close-btn" onclick="closeModal()">✕</button>
+            <div class="modal-header" id="modalHeader"></div>
+            <div class="modal-body" id="modalBody"></div>
+        </div>
+    </div>
+
+    <script>
+        const blocks = """ + json.dumps([{
+            'index': b.index,
+            'timestamp': b.timestamp,
+            'hash': b.hash,
+            'previous_hash': b.previous_hash,
+            'data': b.data if isinstance(b.data, dict) else {}
+        } for b in blockchain.chain]) + """;
+
+        function generateBlocks() {
+            const grid = document.getElementById('blocksGrid');
+            blocks.forEach(block => {
+                const data = block.data || {};
+                const detections = data.detections || [];
+                const threats = detections.filter(d => d.severity && d.severity !== 'INFO');
+                
+                const card = document.createElement('div');
+                card.className = 'block-card';
+                card.onclick = () => showDetails(block);
+
+                let content = `<div class="block-header">Block #${block.index}</div>`;
+                
+                if (data.filename) {
+                    content += `<div class="block-preview"><strong>File:</strong> ${data.filename.substring(0, 30)}</div>`;
+                }
+                
+                if (data.timestamp) {
+                    const date = new Date(data.timestamp).toLocaleString();
+                    content += `<div class="block-preview"><strong>Time:</strong> ${date}</div>`;
+                }
+                
+                if (threats.length > 0) {
+                    content += `<div class="threat-badge">🚨 ${threats.length} Threat(s)</div>`;
+                } else {
+                    content += `<div class="threat-badge success">✓ Safe - No Threats</div>`;
+                }
+
+                content += `<div class="hash-preview">Hash: ${block.hash.substring(0, 16)}...</div>`;
+                
+                if (block.index > 0) {
+                    content += `<div class="hash-link">← Previous: ${block.previous_hash.substring(0, 16)}...</div>`;
+                }
+
+                card.innerHTML = content;
+                grid.appendChild(card);
+            });
+        }
+
+        function showDetails(block) {
+            const data = block.data || {};
+            const detections = data.detections || [];
+            
+            const header = document.getElementById('modalHeader');
+            header.innerHTML = `Block #${block.index} - ${data.filename || 'Scan'}`;
+
+            const body = document.getElementById('modalBody');
+            
+            let imageHtml = `<div class="images-container">`;
+            
+            if (data.original_image) {
+                imageHtml += `
+                    <div class="image-section">
+                        <h3 style="color: var(--primary); margin-bottom: 10px; text-align: center;">Scanned Image</h3>
+                        <img src="data:image/jpeg;base64,${data.original_image}" alt="Original">
+                        <div class="image-label">Original Image</div>
+                    </div>
+                `;
+            }
+
+            if (data.annotated_image) {
+                imageHtml += `
+                    <div class="image-section">
+                        <h3 style="color: var(--success); margin-bottom: 10px; text-align: center;">Annotated Image</h3>
+                        <img src="data:image/jpeg;base64,${data.annotated_image}" alt="Annotated">
+                        <div class="image-label">Analysis Result</div>
+                    </div>
+                `;
+            }
+
+            imageHtml += `</div>`;
+
+            let detailsHtml = `
+                <div class="details-section">
+                    <div class="detail-item">
+                        <div class="detail-label">🔗 Block Hash</div>
+                        <div class="detail-value" style="font-family: monospace; font-size: 0.8em; word-break: break-all;">${block.hash}</div>
+                    </div>
+                    <div class="detail-item">
+                        <div class="detail-label">🔐 Previous Hash</div>
+                        <div class="detail-value" style="font-family: monospace; font-size: 0.8em; word-break: break-all;">${block.previous_hash}</div>
+                    </div>
+                    <div class="detail-item">
+                        <div class="detail-label">Timestamp</div>
+                        <div class="detail-value">${data.timestamp ? new Date(data.timestamp).toLocaleString() : 'N/A'}</div>
+                    </div>
+                    <div class="detail-item">
+                        <div class="detail-label">Filename</div>
+                        <div class="detail-value">${data.filename || 'N/A'}</div>
+                    </div>
+                    <div class="detail-item">
+                        <div class="detail-label">Total Threats Detected</div>
+                        <div class="detail-value">${data.total_threats || 0}</div>
+                    </div>
+            `;
+
+            if (detections.length > 0) {
+                detailsHtml += `
+                    <div class="threats-list">
+                        <h3>Threat Details</h3>
+                `;
+                
+                detections.forEach(det => {
+                    const severity = det.severity || 'UNKNOWN';
+                    const severityClass = severity === 'CRITICAL' ? 'critical' : severity === 'HIGH' ? 'high' : 'medium';
+                    const confidence = (det.confidence * 100).toFixed(1);
+                    
+                    detailsHtml += `
+                        <div class="threat-item ${severity.toLowerCase()}">
+                            <div class="threat-name">
+                                🚨 ${det.item}
+                                <span class="threat-severity ${severityClass}">${severity}</span>
+                            </div>
+                            <div class="threat-confidence">Confidence: ${confidence}%</div>
+                        </div>
+                    `;
+                });
+
+                detailsHtml += `</div>`;
+            } else {
+                detailsHtml += `<div class="detail-item"><strong style="color: var(--success);">✓ No threats detected - Image is SAFE</strong></div>`;
+            }
+
+            detailsHtml += `</div>`;
+
+            body.innerHTML = imageHtml + detailsHtml;
+            document.getElementById('detailModal').classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('detailModal').classList.remove('active');
+        }
+
+        document.getElementById('detailModal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                closeModal();
+            }
+        });
+
+        generateBlocks();
+    </script>
+</body>
+</html>"""
+    return html
+
+
+if __name__ == "__main__":
+    socketio.run(app, debug=True, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
+from flask import Flask, render_template_string, request, jsonify, send_file
+from flask_socketio import SocketIO, emit
+import cv2
+import numpy as np
+import base64
+import threading
+import json
+import os
+from datetime import datetime
+import image as detection_module
+from werkzeug.utils import secure_filename
+from PIL import Image
+import io
+
+app = Flask(__name__)
+app.secret_key = "xray-scanner-secret-key"
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# Upload configuration
+UPLOAD_ROOT = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOAD_ROOT, exist_ok=True)
+ALLOWED_EXT = {"png", "jpg", "jpeg", "gif", "mp4", "avi"}
+
+# Global variables
+detection_results = []
+threat_log = []
+scanning = False
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
+
+@app.route("/")
+def index():
+    html = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>🔍 X-RAY THREAT SCANNER - Security Screening System</title>
+        <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+        <style>
+            :root {
+                --primary: #00d4ff;
+                --primary-dark: #0088cc;
+                --danger: #ff3333;
+                --warning: #ffaa00;
+                --success: #00ff88;
+                --dark-bg: #0a0e27;
+                --card-bg: #1a1f3a;
+                --text-light: #e0e0e0;
+                --text-muted: #888;
+            }
+            
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, var(--dark-bg) 0%, #0f1629 100%);
+                color: var(--text-light);
+                overflow-x: hidden;
+            }
+            
+            .container {
+                max-width: 1400px;
+                margin: 0 auto;
+                padding: 20px;
+            }
+            
+            header {
+                text-align: center;
+                margin-bottom: 30px;
+                border-bottom: 2px solid var(--primary);
+                padding-bottom: 20px;
+            }
+            
+            h1 {
+                font-size: 2.5em;
+                color: var(--primary);
+                text-shadow: 0 0 20px rgba(0, 212, 255, 0.5);
+                margin-bottom: 10px;
+            }
+            
+            .subtitle {
+                color: var(--text-muted);
+                font-size: 1.1em;
+            }
+            
+            .dashboard {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 20px;
+                margin-bottom: 20px;
+            }
+            
+            @media (max-width: 1024px) {
+                .dashboard { grid-template-columns: 1fr; }
+            }
+            
+            .card {
+                background: linear-gradient(135deg, var(--card-bg) 0%, rgba(26, 31, 58, 0.8) 100%);
+                border: 1px solid rgba(0, 212, 255, 0.2);
+                border-radius: 12px;
+                padding: 20px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            }
+            
+            .camera-section {
+                position: relative;
+                border-radius: 12px;
+                overflow: hidden;
+                box-shadow: 0 0 30px rgba(0, 212, 255, 0.3);
+            }
+            
+            #camera-feed {
+                width: 100%;
+                height: 400px;
+                background: #000;
+                border-radius: 8px;
+                object-fit: cover;
+                display: none;
+            }
+            
+            .camera-placeholder {
+                width: 100%;
+                height: 400px;
+                background: radial-gradient(circle, rgba(0,212,255,0.1) 0%, transparent 70%);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                border-radius: 8px;
+                border: 2px dashed var(--primary);
+                color: var(--text-muted);
+                font-size: 1.1em;
+            }
+            
+            .controls {
+                display: flex;
+                gap: 10px;
+                margin: 20px 0;
+                flex-wrap: wrap;
+            }
+            
+            button {
+                padding: 12px 24px;
+                border: none;
+                border-radius: 8px;
+                font-size: 1em;
+                font-weight: bold;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            
+            .btn-primary {
+                background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+                color: #000;
+                box-shadow: 0 4px 15px rgba(0, 212, 255, 0.4);
+            }
+            
+            .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0, 212, 255, 0.6); }
+            .btn-primary:active { transform: translateY(0); }
+            
+            .btn-danger {
+                background: var(--danger);
+                color: white;
+            }
+            
+            .btn-danger:hover { background: #ff5555; }
+            
+            .btn-success {
+                background: var(--success);
+                color: #000;
+            }
+            
+            .detection-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 15px;
+            }
+            
+            .detection-item {
+                background: rgba(0, 212, 255, 0.1);
+                border: 2px solid var(--primary);
+                border-radius: 8px;
+                padding: 15px;
+                text-align: center;
+                animation: slideIn 0.3s ease;
+            }
+            
+            @keyframes slideIn {
+                from { opacity: 0; transform: translateY(10px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+            
+            .detection-item.critical {
+                border-color: var(--danger);
+                background: rgba(255, 51, 51, 0.1);
+            }
+            
+            .detection-item.warning {
+                border-color: var(--warning);
+                background: rgba(255, 170, 0, 0.1);
+            }
+            
+            .item-name {
+                font-weight: bold;
+                font-size: 1.2em;
+                margin-bottom: 5px;
+            }
+            
+            .item-severity {
+                font-size: 0.9em;
+                padding: 5px 10px;
+                border-radius: 4px;
+                display: inline-block;
+                background: rgba(0, 0, 0, 0.3);
+            }
+            
+            .item-severity.critical { color: var(--danger); }
+            .item-severity.warning { color: var(--warning); }
+            .item-severity.info { color: var(--primary); }
+            
+            .status-badge {
+                display: inline-block;
+                padding: 8px 16px;
+                border-radius: 20px;
+                font-weight: bold;
+                margin: 5px 0;
+            }
+            
+            .status-active { background: var(--success); color: #000; }
+            .status-inactive { background: var(--text-muted); color: #000; }
+            .status-threat { background: var(--danger); color: white; }
+            
+            .threat-log {
+                background: rgba(0, 0, 0, 0.3);
+                border-left: 4px solid var(--primary);
+                border-radius: 4px;
+                padding: 15px;
+                margin: 10px 0;
+                max-height: 300px;
+                overflow-y: auto;
+            }
+            
+            .threat-entry {
+                padding: 10px;
+                border-bottom: 1px solid rgba(0, 212, 255, 0.1);
+                font-size: 0.9em;
+            }
+            
+            .threat-entry:last-child { border-bottom: none; }
+            
+            .threat-time {
+                color: var(--text-muted);
+                font-size: 0.8em;
+            }
+            
+            .threat-item {
+                color: var(--primary);
+                font-weight: bold;
+            }
+            
+            .threat-item.critical { color: var(--danger); }
+            
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                gap: 10px;
+                margin: 15px 0;
+            }
+            
+            .stat {
+                background: rgba(0, 212, 255, 0.1);
+                border: 1px solid var(--primary);
+                border-radius: 8px;
+                padding: 15px;
+                text-align: center;
+            }
+            
+            .stat-value {
+                font-size: 2em;
+                font-weight: bold;
+                color: var(--primary);
+            }
+            
+            .stat-label {
+                font-size: 0.9em;
+                color: var(--text-muted);
+                margin-top: 5px;
+            }
+            
+            .upload-section {
+                border: 2px dashed var(--primary);
+                border-radius: 8px;
+                padding: 20px;
+                text-align: center;
+                cursor: pointer;
+                transition: all 0.3s ease;
+            }
+            
+            .upload-section:hover {
+                background: rgba(0, 212, 255, 0.1);
+            }
+            
+            #file-input { display: none; }
+            
+            .spinner {
+                border: 4px solid rgba(0, 212, 255, 0.2);
+                border-top: 4px solid var(--primary);
+                border-radius: 50%;
+                width: 40px;
+                height: 40px;
+                animation: spin 1s linear infinite;
+                margin: 20px auto;
+            }
+            
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <h1>🔍 X-RAY THREAT SCANNER</h1>
+                <p class="subtitle">Real-time Security Screening System | Detect Suspicious Items via Camera</p>
+            </header>
+            
+            <div class="dashboard" style="grid-template-columns: 1fr 1fr;">
+                <!-- Normal Camera Feed Section -->
+                <div class="card">
+                    <h2 style="margin-bottom: 15px; color: var(--primary);">📹 NORMAL CAMERA</h2>
+                    <div class="camera-section">
+                        <video id="camera-feed" playsinline autoplay muted></video>
+                        <div class="camera-placeholder" id="placeholder-normal">
+                            <span>📷 No camera active</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- X-Ray Camera Feed Section -->
+                <div class="card">
+                    <h2 style="margin-bottom: 15px; color: #00ff00;">🔍 X-RAY SCANNER (Real-time)</h2>
+                    <div class="camera-section">
+                        <canvas id="canvas-xray" style="width:100%; height:400px; background:#000; border-radius:8px;"></canvas>
+                        <div class="camera-placeholder" id="placeholder-xray">
+                            <span>🔎 X-ray scan pending</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Controls -->
+            <div class="card" style="margin-top: 20px;">
+                <div style="display: flex; gap: 15px; flex-wrap: wrap; align-items: center; justify-content: center;">
+                    <button class="btn-primary" id="start-btn" style="padding: 15px 30px; font-size: 1.1em;">▶ START DUAL SCANNING</button>
+                    <button class="btn-danger" id="stop-btn" style="display:none; padding: 15px 30px; font-size: 1.1em;">⏹ STOP SCANNING</button>
+                    <div class="stats-grid" style="flex: 1; min-width: 300px; margin: 0;">
+                        <div class="stat">
+                            <div class="stat-value" id="threat-count">0</div>
+                            <div class="stat-label">Threats Detected</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="scan-status">IDLE</div>
+                            <div class="stat-label">Status</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-value" id="frame-count">0</div>
+                            <div class="stat-label">Frames Scanned</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Detection Results Section -->
+            <div class="card" style="margin-top: 20px;">
+                <h2 style="margin-bottom: 15px; color: var(--primary);">⚠️ REAL-TIME THREAT DETECTION</h2>
+                <div id="detections" class="detection-grid">
+                    <p style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">✓ Scan for threats</p>
+                </div>
+            </div>
+            
+            <!-- Threat Log Section -->
+            <div class="card">
+                <h2 style="margin-bottom: 15px; color: var(--primary);">📋 THREAT LOG</h2>
+                <div class="threat-log" id="threat-log">
+                    <p style="color: var(--text-muted); text-align: center;">No threats logged yet</p>
+                </div>
+            </div>
+            
+            <!-- Upload Section -->
+            <div class="card" style="margin-top: 20px;">
+                <h2 style="margin-bottom: 15px; color: var(--primary);">📤 SCAN IMAGE FILE</h2>
+                <div class="upload-section" id="upload-area">
+                    <p>📁 Click to upload or drag & drop an image/video file</p>
+                    <p style="font-size: 0.9em; color: var(--text-muted);">Supported formats: JPG, PNG, GIF</p>
+                </div>
+                <input type="file" id="file-input" accept="image/*,video/*">
+            </div>
+        </div>
+        
+        <script>
+            const socket = io();
+            let stream = null;
+            let scanning = false;
+            let frameCount = 0;
+            
+            // DOM Elements
+            const startBtn = document.getElementById('start-btn');
+            const stopBtn = document.getElementById('stop-btn');
+            const videoFeed = document.getElementById('camera-feed');
+            const canvasXray = document.getElementById('canvas-xray');
+            const xrayCtx = canvasXray.getContext('2d');
+            const placeholderNormal = document.getElementById('placeholder-normal');
+            const placeholderXray = document.getElementById('placeholder-xray');
+            const threatCountEl = document.getElementById('threat-count');
+            const scanStatusEl = document.getElementById('scan-status');
+            const frameCountEl = document.getElementById('frame-count');
+            const detectionsEl = document.getElementById('detections');
+            const threatLogEl = document.getElementById('threat-log');
+            const uploadArea = document.getElementById('upload-area');
+            const fileInput = document.getElementById('file-input');
+            
+            // Setup Canvas for X-Ray display
+            function setupCanvasSize() {
+                if (videoFeed.videoWidth > 0) {
+                    canvasXray.width = videoFeed.videoWidth;
+                    canvasXray.height = videoFeed.videoHeight;
+                }
+            }
+            
+            // Start Dual Camera Scanning
+            startBtn.addEventListener('click', async () => {
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+                    });
+                    
+                    videoFeed.srcObject = stream;
+                    videoFeed.style.display = 'block';
+                    placeholderNormal.style.display = 'none';
+                    placeholderXray.style.display = 'none';
+                    canvasXray.style.display = 'block';
+                    
+                    scanning = true;
+                    frameCount = 0;
+                    
+                    startBtn.style.display = 'none';
+                    stopBtn.style.display = 'inline-block';
+                    scanStatusEl.textContent = 'ACTIVE';
+                    scanStatusEl.style.color = 'var(--success)';
+                    
+                    // Wait for video to load
+                    setTimeout(() => {
+                        setupCanvasSize();
+                        captureFrames();
+                    }, 500);
+                } catch (err) {
+                    alert('Camera access denied. Please enable camera permissions.');
+                    console.error(err);
+                }
+            });
+            
+            // Stop Dual Camera Scanning
+            stopBtn.addEventListener('click', () => {
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                }
+                
+                videoFeed.style.display = 'none';
+                canvasXray.style.display = 'none';
+                placeholderNormal.style.display = 'flex';
+                placeholderXray.style.display = 'flex';
+                scanning = false;
+                
+                startBtn.style.display = 'inline-block';
+                stopBtn.style.display = 'none';
+                scanStatusEl.textContent = 'IDLE';
+                scanStatusEl.style.color = 'var(--warning)';
+            });
+            
+            // Apply X-Ray Effect to Canvas
+            function applyXrayEffect(imageData) {
+                const data = imageData.data;
+                
+                // Convert to grayscale and apply edge detection effect
+                for (let i = 0; i < data.length; i += 4) {
+                    const gray = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+                    
+                    // Invert for X-ray effect
+                    const inverted = 255 - gray;
+                    
+                    data[i] = Math.max(0, inverted * 0.3);     // Red - reduce
+                    data[i + 1] = Math.min(255, inverted * 1.3); // Green - enhance
+                    data[i + 2] = Math.max(0, inverted * 0.5);  // Blue - reduce
+                    data[i + 3] = 255;  // Alpha
+                }
+                
+                return imageData;
+            }
+            
+            // Continuous Frame Capture & Dual Display
+            function captureFrames() {
+                if (!scanning) return;
+                
+                try {
+                    // Draw normal camera feed
+                    if (videoFeed.videoWidth > 0 && videoFeed.videoHeight > 0) {
+                        // Draw to X-ray canvas with effect
+                        const tempCanvas = document.createElement('canvas');
+                        tempCanvas.width = videoFeed.videoWidth;
+                        tempCanvas.height = videoFeed.videoHeight;
+                        const tempCtx = tempCanvas.getContext('2d');
+                        tempCtx.drawImage(videoFeed, 0, 0);
+                        
+                        // Get image data and apply X-ray effect
+                        let imageData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+                        imageData = applyXrayEffect(imageData);
+                        
+                        // Display X-ray on canvas
+                        canvasXray.width = tempCanvas.width;
+                        canvasXray.height = tempCanvas.height;
+                        xrayCtx.putImageData(imageData, 0, 0);
+                        
+                        // Send frame for threat detection every 2 frames
+                        frameCount++;
+                        frameCountEl.textContent = frameCount;
+                        
+                        if (frameCount % 2 === 0) {
+                            // Convert canvas to blob and send for detection
+                            tempCanvas.toBlob(blob => {
+                                uploadFrame(blob);
+                            }, 'image/jpeg', 0.6);
+                        }
+                    }
+                } catch (err) {
+                    console.error('Frame capture error:', err);
+                }
+                
+                requestAnimationFrame(captureFrames);
+            }
+            
+            // Upload and detect threats in frame
+            function uploadFrame(blob) {
+                const formData = new FormData();
+                formData.append('frame', blob);
+                
+                fetch('/detect_dual', { method: 'POST', body: formData })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.detections) {
+                            updateDetections(data.detections);
+                            if (data.detections.length > 0) {
+                                addThreatLog(data.detections);
+                            }
+                        }
+                    })
+                    .catch(err => console.error('Detection error:', err));
+            }
+            
+            // Upload Image File
+            uploadArea.addEventListener('click', () => fileInput.click());
+            uploadArea.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                uploadArea.style.background = 'rgba(0, 212, 255, 0.2)';
+            });
+            uploadArea.addEventListener('dragleave', () => {
+                uploadArea.style.background = '';
+            });
+            uploadArea.addEventListener('drop', (e) => {
+                e.preventDefault();
+                uploadArea.style.background = '';
+                if (e.dataTransfer.files[0]) handleFileUpload(e.dataTransfer.files[0]);
+            });
+            fileInput.addEventListener('change', (e) => {
+                if (e.target.files[0]) handleFileUpload(e.target.files[0]);
+            });
+            
+            function handleFileUpload(file) {
+                if (!file) return;
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                fetch('/upload', { method: 'POST', body: formData })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.detections) {
+                            updateDetections(data.detections);
+                            if (data.detections.length > 0) {
+                                addThreatLog(data.detections);
+                            }
+                        }
+                    })
+                    .catch(err => console.error('Upload error:', err));
+            }
+            
+            function updateDetections(detections) {
+                threatCountEl.textContent = detections.length;
+                
+                if (detections.length === 0) {
+                    detectionsEl.innerHTML = '<p style="color: var(--text-muted); text-align: center; grid-column: 1/-1;">✓ Scan active - No threats yet</p>';
+                    return;
+                }
+                
+                let html = '';
+                detections.forEach(d => {
+                    const severity = (d.severity || 'INFO').toUpperCase();
+                    const severityClass = severity === 'CRITICAL' ? 'critical' : severity === 'HIGH' ? 'warning' : '';
+                    const confPercent = (d.confidence * 100).toFixed(0);
+                    
+                    html += `
+                        <div class="detection-item ${severityClass}">
+                            <div class="item-name">🚨 ${d.item}</div>
+                            <div class="item-severity ${severity.toLowerCase()}">${severity}</div>
+                            <div style="font-size: 0.8em; color: var(--text-muted); margin-top: 5px;">Confidence: ${confPercent}%</div>
+                            ${d.bbox ? `<div style="font-size: 0.75em; color: #00ff00; margin-top: 3px;">📍 [${d.bbox[0]}, ${d.bbox[1]}]</div>` : ''}
+                        </div>
+                    `;
+                });
+                detectionsEl.innerHTML = html;
+            }
+            
+            function addThreatLog(detections) {
+                const timestamp = new Date().toLocaleTimeString();
+                let logHtml = '';
+                
+                if (threatLogEl.querySelector('p')) {
+                    threatLogEl.innerHTML = '';
+                }
+                
+                detections.forEach(d => {
+                    const severity = (d.severity || '').toUpperCase();
+                    const severityClass = severity === 'CRITICAL' ? 'critical' : '';
+                    logHtml += `
+                        <div class="threat-entry">
+                            <div class="threat-time">[${timestamp}]</div>
+                            <strong class="threat-item ${severityClass}">🚨 ${d.item.toUpperCase()}</strong>
+                            <div style="font-size: 0.85em; margin-top: 3px;">Severity: <strong>${d.severity || 'HIGH'}</strong> | Confidence: ${(d.confidence * 100).toFixed(0)}%</div>
+                        </div>
+                    `;
+                });
+                
+                threatLogEl.insertAdjacentHTML('afterbegin', logHtml);
+                
+                // Keep only last 20 entries
+                const entries = threatLogEl.querySelectorAll('.threat-entry');
+                if (entries.length > 20) {
+                    entries[entries.length - 1].remove();
+                }
+            }
+            
+            // Socket events
+            socket.on('detection_update', (data) => {
+                if (data.detections) {
+                    updateDetections(data.detections);
+                    addThreatLog(data.detections);
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return render_template_string(html)
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    
+    file = request.files["file"]
+    if not file or not allowed_file(file.filename):
+        return jsonify({"error": "Invalid file"}), 400
+    
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(UPLOAD_ROOT, filename)
+    file.save(filepath)
+    
+    # Detect objects in uploaded image
+    detections = detection_module.detect_threats(filepath)
+    
+    return jsonify({
+        "success": True,
+        "file": filename,
+        "detections": detections
+    })
+
+@app.route("/detect", methods=["POST"])
+def detect():
+    if "frame" not in request.files:
+        return jsonify({"error": "No frame provided"}), 400
+    
+    frame = request.files["frame"]
+    frame_data = frame.read()
+    
+    # Convert byte stream to image
+    img = Image.open(io.BytesIO(frame_data))
+    
+    # Temporary save for processing
+    temp_path = os.path.join(UPLOAD_ROOT, "temp_frame.jpg")
+    img.save(temp_path)
+    
+    # Detect objects
+    result = detection_module.detect_threats(temp_path)
+    
+    # Handle both old and new return formats
+    if isinstance(result, dict) and "detections" in result:
+        detections = result["detections"]
+    else:
+        detections = result if isinstance(result, list) else []
+    
+    return jsonify({
+        "success": True,
+        "detections": detections
+    })
+
+@app.route("/detect_dual", methods=["POST"])
+def detect_dual():
+    """
+    Real-time threat detection with YOLOv8.
+    Used for continuous frame scanning with dual cameras.
+    """
+    if "frame" not in request.files:
+        return jsonify({"error": "No frame provided"}), 400
+    
+    try:
+        frame_file = request.files["frame"]
+        frame_data = frame_file.read()
+        
+        # Convert byte stream to OpenCV format
+        nparr = np.frombuffer(frame_data, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if frame is None:
+            return jsonify({"detections": []})
+        
+        # Run real object detection
+        result = detection_module.detect_threats_from_frame(frame, "stream")
+        detections = result.get("detections", [])
+        
+        # Keep all non-INFO detections so items like knife and suspicious objects are reported
+        threat_detections = [d for d in detections if d.get("severity") != "INFO"]
+        
+        return jsonify({
+            "success": True,
+            "detections": threat_detections
+        })
+    
+    except Exception as e:
+        print(f"Dual detection error: {e}")
+        return jsonify({"success": False, "detections": [], "error": str(e)})
+
+if __name__ == "__main__":
+    socketio.run(app, debug=True, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
 
 # ---------------------------
 # AI FRAUD DETECTION
@@ -267,8 +2196,7 @@ def create_project():
         contractors[project_id] = contractor
         payment_history[project_id] = []
         work_logs[project_id] = []
-        if contractor_name not in ratings:
-            ratings[contractor_name] = []
+        ratings[project_id] = []
  
         blockchain.add_block({
             "action": "Project Created",
@@ -688,12 +2616,6 @@ def uploaded_file(project_id, filename):
     proj_dir = os.path.join(UPLOAD_ROOT, project_id)
     return send_from_directory(proj_dir, filename)
 
-# Serve rating images
-@app.route("/uploads/ratings/<filename>")
-def rating_image(filename):
-    ratings_dir = os.path.join(UPLOAD_ROOT, "ratings")
-    return send_from_directory(ratings_dir, filename)
-
 # ---------------------------
 # HOME DASHBOARD
 # ---------------------------
@@ -790,12 +2712,7 @@ def home():
                         <input name="budget" placeholder="Budget" type="number" step="0.01" style="padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:white;">
                         <select name="contractor" style="padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:white;">
                             {% for c in available_contractors %}
-                                {% set summary = contractor_ratings.get(c, {'avg': 0, 'count': 0}) %}
-                                {% if summary.count > 0 %}
-                                    <option value="{{c}}">{{c}} ({{summary.avg}}/5, {{summary.count}} ratings)</option>
-                                {% else %}
-                                    <option value="{{c}}">{{c}} (No ratings)</option>
-                                {% endif %}
+                                <option value="{{c}}">{{c}}</option>
                             {% endfor %}
                         </select>
                         <button type="submit" class="btn btn-blue" style="width:160px;">Create Project</button>
@@ -852,33 +2769,9 @@ def home():
                             {% endfor %}
                         {% endfor %}
                     </div>
-
-                    <!-- Contractor Ratings Overview -->
-                    <div style="margin-top:14px;">
-                        <h3 style="margin:6px 0 8px 0;">⭐ Contractor Ratings</h3>
-                        {% for contractor_name, summary in contractor_ratings.items() %}
-                            <div style="background:rgba(0,0,0,0.16);padding:10px;border-radius:10px;margin-bottom:10px;">
-                                <div style="display:flex;justify-content:space-between;align-items:center;">
-                                    <div><strong>{{contractor_name}}</strong></div>
-                                    <div style="font-size:18px;color:#7dd3fc;">{{summary.avg}}/5 ({{summary.count}} ratings)</div>
-                                </div>
-                                <div style="margin-top:8px;">
-                                    {% for r in summary.ratings[:3] %}  {# Show last 3 ratings #}
-                                        <div style="font-size:12px;color:rgba(255,255,255,0.75);margin-bottom:4px;">
-                                            {{r.score}}/5: {{r.comment}} {% if r.image %}<a href="/uploads/ratings/{{r.image}}" target="_blank">[Image]</a>{% endif %}
-                                        </div>
-                                    {% endfor %}
-                                    {% if summary.count > 3 %}
-                                        <div style="font-size:12px;color:rgba(255,255,255,0.6);">... and {{ (summary.count - 3) }} more</div>
-                                    {% endif %}
-                                </div>
-                            </div>
-                        {% endfor %}
-                        {% if not ratings %}
-                            <div style="color:rgba(255,255,255,0.6);">No contractor ratings yet.</div>
-                        {% endif %}
-                    </div>
                 </div>
+
+                <div style="width:320px;">
                     <div class="analysis-grid">
                         <div class="chart-card">
                             <h4 style="margin:4px 0 8px 0;">📊 Project Analysis</h4>
@@ -920,15 +2813,6 @@ def home():
                             <div class="project-meta">
                                 <div><strong>Total:</strong> ₹{{proj.total_budget}}</div>
                                 <div><strong>Released:</strong> ₹{{proj.released_amount}}</div>
-                                {% set contractor_name = (contractors.get(pid).name) if contractors.get(pid) else None %}
-                                {% if contractor_name %}
-                                    {% set summary = contractor_ratings.get(contractor_name, {'avg': 0, 'count': 0}) %}
-                                    {% if summary.count > 0 %}
-                                        <div><strong>Rating:</strong> {{summary.avg}}/5 ({{summary.count}})</div>
-                                    {% else %}
-                                        <div><strong>Rating:</strong> No ratings</div>
-                                    {% endif %}
-                                {% endif %}
                             </div>
                         </div>
                     </div>
@@ -946,27 +2830,24 @@ def home():
                                 <li>No completed work yet.</li>
                             {% endif %}
                         </ul>
-                        <p><strong>Contractor Rating:</strong>
-                            {% set contractor_name = (contractors.get(pid).name) if contractors.get(pid) else None %}
-                            {% if contractor_name %}
-                                {% set summary = contractor_ratings.get(contractor_name, {'avg': 0, 'count': 0}) %}
-                                {% if summary.count > 0 %}
-                                    {{summary.avg}} / 5 ({{summary.count}} ratings)
-                                {% else %}
-                                    No ratings yet.
-                                {% endif %}
+                        <p><strong>Average Rating:</strong>
+                            {% set rs = ratings.get(pid, []) %}
+                            {% if rs and (rs|length) > 0 %}
+                                {% set total = 0 %}
+                                {% for r in rs %}
+                                    {% set total = total + r['score'] %}
+                                {% endfor %}
+                                {{ (total / (rs|length)) | round(2) }} / 5 ({{ rs|length }} ratings)
                             {% else %}
-                                Contractor not assigned.
+                                No ratings yet.
                             {% endif %}
                         </p>
                         <hr>
-                        <form method="POST" action="/rate/{{pid}}" enctype="multipart/form-data">
+                        <form method="POST" action="/rate/{{pid}}">
                             <label>Rate Contractor (1-5):</label><br>
                             <input type="number" name="score" min="1" max="5" required><br><br>
-                            <label>Comment/Feedback:</label><br>
+                            <label>Comment:</label><br>
                             <input type="text" name="comment" style="width:100%"><br><br>
-                            <label>Optional Image (work sample):</label><br>
-                            <input type="file" name="image" accept="image/*"><br><br>
                             <button type="submit" class="btn btn-blue">Submit Rating</button>
                         </form>
                     </div>
@@ -1134,6 +3015,9 @@ def home():
                          card.style.display = (!q || text.includes(q)) ? '' : 'none';
                      });
                  }
+                 
+                 // Fix for JavaScript code (this was leftover from old app)
+                 function toast(msg){ }
 
                 // small toast helper
                 function toast(msg){ const el = document.createElement('div'); el.innerText = msg; el.style.position='fixed'; el.style.right='18px'; el.style.bottom='18px'; el.style.padding='10px 14px'; el.style.background='rgba(2,6,23,0.9)'; el.style.color='#fff'; el.style.borderRadius='10px'; el.style.boxShadow='0 8px 24px rgba(2,6,23,0.6)'; document.body.appendChild(el); setTimeout(()=>el.style.opacity='0',1400); setTimeout(()=>document.body.removeChild(el),2000); }
@@ -1190,8 +3074,6 @@ def home():
         "contractors_count": contractors_count
     }
 
-    contractor_ratings = get_contractor_rating_summary()
-
     return render_template_string(
         html,
         projects=projects,
@@ -1203,70 +3085,8 @@ def home():
         funding_requests=funding_requests,
         fund_requests=fund_requests,
         work_logs=work_logs,
-        ratings=ratings,
-        contractor_ratings=contractor_ratings
+        ratings=ratings
     )
-
-
-# ---------------------------
-# RATE PROJECT (Public Only)
-# ---------------------------
-@app.route("/rate/<project_id>", methods=["POST"])
-def rate_project(project_id):
-    if session.get("role") != "public":
-        return "Unauthorized"
-
-    score = request.form.get("score")
-    comment = request.form.get("comment", "").strip()
-
-    # Validate score
-    try:
-        score = int(score)
-        if not 1 <= score <= 5:
-            return "Invalid score. Must be between 1 and 5."
-    except ValueError:
-        return "Invalid score. Must be a number between 1 and 5."
-
-    # Get contractor name
-    contractor = contractors.get(project_id)
-    if not contractor:
-        return "Invalid project or contractor not found."
-    contractor_name = contractor.name
-
-    # Handle optional image
-    image_filename = None
-    image_file = request.files.get("image")
-    if image_file and allowed_file(image_file.filename):
-        ratings_dir = os.path.join(UPLOAD_ROOT, "ratings")
-        os.makedirs(ratings_dir, exist_ok=True)
-        image_filename = secure_filename(f"rating_{int(__import__('time').time())}_{image_file.filename}")
-        image_file.save(os.path.join(ratings_dir, image_filename))
-
-    # Add to ratings per contractor
-    ratings.setdefault(contractor_name, []).append({
-        "score": score,
-        "comment": comment,
-        "ts": datetime.datetime.now().isoformat(),
-        "project_id": project_id,
-        "image": image_filename
-    })
-
-    # Record on blockchain
-    blockchain.add_block({
-        "action": "Rating Submitted",
-        "contractor": contractor_name,
-        "project_id": project_id,
-        "score": score,
-        "comment": comment,
-        "submitted_by": "public"
-    })
-
-    try:
-        socketio.emit('refresh', {'msg': f'Rating submitted for contractor {contractor_name}'}, broadcast=True)
-    except Exception:
-        pass
-
-    return redirect("/")
 
 
 # ---------------------------
@@ -1279,5 +3099,5 @@ def validate():
 
 if __name__ == "__main__":
     # Bind to all interfaces so the app is reachable from localhost and other hosts
-    print("Starting Transparency Dashboard with SocketIO on http://0.0.0.0:8000")
+    print("Starting Transparency Dashboard with SocketIO on http://0.0.0.0:5000")
     socketio.run(app, host="0.0.0.0", port=8000, debug=True)
